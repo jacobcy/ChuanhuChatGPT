@@ -1,3 +1,4 @@
+from langchain.chains.qa_with_sources import load_qa_with_sources_chain
 from langchain.chains.summarize import load_summarize_chain
 from langchain import PromptTemplate, LLMChain
 from langchain.chat_models import ChatOpenAI
@@ -30,7 +31,7 @@ from threading import Thread, Condition
 from collections import deque
 
 from .base_model import BaseLLMModel, CallbackToIterator, ChuanhuCallbackHandler
-from ..config import default_chuanhu_assistant_model
+from ..config import default_chuanhu_assistant_model, http_proxy
 from ..presets import SUMMARIZE_PROMPT, i18n
 from ..index_func import construct_index
 
@@ -39,32 +40,54 @@ import os
 import gradio as gr
 import logging
 
+# import pinecone
+import pinecone
+from langchain.vectorstores import Pinecone
+pinecone.init(
+    api_key=os.environ.get("PINECONE_API_KEY"),
+    environment=os.environ.get("PINECONE_ENVIRONMENT")
+)
+
+
 class GoogleSearchInput(BaseModel):
     keywords: str = Field(description="keywords to search")
+
 
 class WebBrowsingInput(BaseModel):
     url: str = Field(description="URL of a webpage")
 
+
 class WebAskingInput(BaseModel):
     url: str = Field(description="URL of a webpage")
-    question: str = Field(description="Question that you want to know the answer to, based on the webpage's content.")
+    question: str = Field(
+        description="Question that you want to know the answer to, based on the webpage's content.")
 
 
 class ChuanhuAgent_Client(BaseLLMModel):
     def __init__(self, model_name, openai_api_key, user_name="") -> None:
         super().__init__(model_name=model_name, user=user_name)
-        self.text_splitter = TokenTextSplitter(chunk_size=500, chunk_overlap=30)
+        self.text_splitter = TokenTextSplitter(
+            chunk_size=500, chunk_overlap=30)
         self.api_key = openai_api_key
-        self.llm = ChatOpenAI(openai_api_key=openai_api_key, temperature=0, model_name=default_chuanhu_assistant_model, openai_api_base=os.environ.get("OPENAI_API_BASE", None))
-        self.cheap_llm = ChatOpenAI(openai_api_key=openai_api_key, temperature=0, model_name="gpt-3.5-turbo", openai_api_base=os.environ.get("OPENAI_API_BASE", None))
-        PROMPT = PromptTemplate(template=SUMMARIZE_PROMPT, input_variables=["text"])
-        self.summarize_chain = load_summarize_chain(self.cheap_llm, chain_type="map_reduce", return_intermediate_steps=True, map_prompt=PROMPT, combine_prompt=PROMPT)
+        self.api_host = os.environ.get("OPENAI_API_BASE", None) + '/v1'
+        self.llm = ChatOpenAI(openai_api_key=openai_api_key, temperature=0,
+                              model_name=default_chuanhu_assistant_model, openai_api_base=self.api_host)
+        self.cheap_llm = ChatOpenAI(openai_api_key=openai_api_key, temperature=0,
+                                    model_name="gpt-3.5-turbo", openai_api_base=self.api_host)
+        PROMPT = PromptTemplate(
+            template=SUMMARIZE_PROMPT, input_variables=["text"])
+        self.summarize_chain = load_summarize_chain(
+            self.cheap_llm, chain_type="map_reduce", return_intermediate_steps=True, map_prompt=PROMPT, combine_prompt=PROMPT)
         self.index_summary = None
         self.index = None
         if "Pro" in self.model_name:
-            self.tools = load_tools(["google-search-results-json", "llm-math", "arxiv", "wikipedia", "wolfram-alpha"], llm=self.llm)
+            self.tools = load_tools(
+                ["google-search-results-json", "llm-math", "arxiv", "wikipedia", "wolfram-alpha"], llm=self.llm)
         else:
-            self.tools = load_tools(["ddg-search", "llm-math", "arxiv", "wikipedia"], llm=self.llm)
+            # self.tools = load_tools(
+            #     ["ddg-search", "llm-math", "arxiv", "wikipedia"], llm=self.llm)
+            self.tools = load_tools(
+                ["llm-math", "arxiv", "wikipedia"], llm=self.llm)
             self.tools.append(
                 Tool.from_function(
                     func=self.google_search_simple,
@@ -92,8 +115,40 @@ class ChuanhuAgent_Client(BaseLLMModel):
             )
         )
 
+        self.tools.append(
+            Tool.from_function(
+                func=self.query_remote_index,
+                name="Query Knowledge Database",
+                description=f"useful when you need to read paper",
+                args_schema=GoogleSearchInput
+            )
+        )
+
+    def query_remote_index(self, query):
+        docsearch = Pinecone.from_existing_index(
+            os.environ.get("PINECONE_INDEX"),
+            OpenAIEmbeddings(openai_api_key=self.api_key,
+                             openai_api_base=self.api_host)
+        )
+        retriever = docsearch.as_retriever(
+            search_kwargs={"k": 5}
+        )
+        # use RetrievalQA chain
+        # qa = RetrievalQA.from_chain_type(
+        #     llm=self.llm, chain_type="stuff", retriever=retriever)
+        # return qa.run(query)
+        # use load_qa_with_sources_chain chain
+        docs = retriever.get_relevant_documents(query)
+        qa = load_qa_with_sources_chain(llm=self.cheap_llm, chain_type="stuff")
+        return qa.run(
+            input_documents=docs,
+            question=query,
+            return_only_outputs=True
+        )
+
     def google_search_simple(self, query):
-        results = [{"title": i.title, "link": i.url, "snippet": i.description} for i in search(query, advanced=True)]
+        results = [{"title": i.title, "link": i.url, "snippet": i.description}
+                   for i in search(query, proxy=http_proxy, advanced=True)]
         return str(results)
 
     def handle_file_upload(self, files, chatbot, language):
@@ -112,10 +167,13 @@ class ChuanhuAgent_Client(BaseLLMModel):
                 from langchain.prompts import PromptTemplate
                 from langchain.chat_models import ChatOpenAI
                 prompt_template = "Write a concise summary of the following:\n\n{text}\n\nCONCISE SUMMARY IN " + language + ":"
-                PROMPT = PromptTemplate(template=prompt_template, input_variables=["text"])
+                PROMPT = PromptTemplate(
+                    template=prompt_template, input_variables=["text"])
                 llm = ChatOpenAI()
-                chain = load_summarize_chain(llm, chain_type="map_reduce", return_intermediate_steps=True, map_prompt=PROMPT, combine_prompt=PROMPT)
-                summary = chain({"input_documents": list(index.docstore.__dict__["_dict"].values())}, return_only_outputs=True)["output_text"]
+                chain = load_summarize_chain(
+                    llm, chain_type="map_reduce", return_intermediate_steps=True, map_prompt=PROMPT, combine_prompt=PROMPT)
+                summary = chain({"input_documents": list(index.docstore.__dict__[
+                                "_dict"].values())}, return_only_outputs=True)["output_text"]
                 logging.info(f"Summary: {summary}")
                 self.index_summary = summary
                 chatbot.append((f"Uploaded {len(files)} files", summary))
@@ -125,7 +183,8 @@ class ChuanhuAgent_Client(BaseLLMModel):
     def query_index(self, query):
         if self.index is not None:
             retriever = self.index.as_retriever()
-            qa = RetrievalQA.from_chain_type(llm=self.llm, chain_type="stuff", retriever=retriever)
+            qa = RetrievalQA.from_chain_type(
+                llm=self.llm, chain_type="stuff", retriever=retriever)
             return qa.run(query)
         else:
             "Error during query."
@@ -160,39 +219,45 @@ class ChuanhuAgent_Client(BaseLLMModel):
         texts = Document(page_content=text)
         texts = self.text_splitter.split_documents([texts])
         # use embedding
-        embeddings = OpenAIEmbeddings(openai_api_key=self.api_key, openai_api_base=os.environ.get("OPENAI_API_BASE", None))
+        embeddings = OpenAIEmbeddings(
+            openai_api_key=self.api_key, openai_api_base=self.api_host)
 
         # create vectorstore
         db = FAISS.from_documents(texts, embeddings)
         retriever = db.as_retriever()
-        qa = RetrievalQA.from_chain_type(llm=self.cheap_llm, chain_type="stuff", retriever=retriever)
+        qa = RetrievalQA.from_chain_type(
+            llm=self.cheap_llm, chain_type="stuff", retriever=retriever)
         return qa.run(f"{question} Reply in 中文")
 
     def get_answer_at_once(self):
         question = self.history[-1]["content"]
         # llm=ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
-        agent = initialize_agent(self.tools, self.llm, agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+        agent = initialize_agent(
+            self.tools, self.llm, agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
         reply = agent.run(input=f"{question} Reply in 简体中文")
         return reply, -1
 
     def get_answer_stream_iter(self):
         question = self.history[-1]["content"]
         it = CallbackToIterator()
-        manager = BaseCallbackManager(handlers=[ChuanhuCallbackHandler(it.callback)])
+        manager = BaseCallbackManager(
+            handlers=[ChuanhuCallbackHandler(it.callback)])
+
         def thread_func():
             tools = self.tools
             if self.index is not None:
-                    tools.append(
-                        Tool.from_function(
+                tools.append(
+                    Tool.from_function(
                         func=self.query_index,
                         name="Query Knowledge Base",
                         description=f"useful when you need to know about: {self.index_summary}",
                         args_schema=WebBrowsingInput
                     )
                 )
-            agent = initialize_agent(self.tools, self.llm, agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, verbose=True, callback_manager=manager)
+            agent = initialize_agent(
+                self.tools, self.llm, agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, verbose=True, callback_manager=manager)
             try:
-                reply = agent.run(input=f"{question} Reply in 简体中文")
+                reply = agent.run(input=f"{question}")
             except Exception as e:
                 import traceback
                 traceback.print_exc()
